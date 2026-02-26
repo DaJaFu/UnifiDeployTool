@@ -1,0 +1,68 @@
+# BC10 Deploy Tool - VLAN Configuration
+# Edit these values before deployment.
+# Secure defaults are applied: inter-VLAN routing OFF, client isolation ON for Guest.
+
+vlans:
+  - id: 10
+    name: "Management"
+    purpose: "corporate"          # gives it L3 gateway + DHCP on the UXG
+    subnet: "10.1.10.0/24"
+    gateway: "10.1.10.1"
+    dhcp_enabled: true
+    dhcp_start: "10.1.10.100"
+    dhcp_stop: "10.1.10.200"
+    dhcp_lease_seconds: 86400
+    dns:
+      - "1.1.1.1"
+      - "1.0.0.1"
+    client_isolation: false       # admins need to reach each other
+    inter_vlan_routing: false     # block by default; add firewall rules manually
+    igmp_snooping: true
+    dhcp_guard: true              # block rogue DHCP servers
+    description: "Network & infrastructure management traffic only"
+
+  - id: 20
+    name: "Private"
+    purpose: "corporate"
+    subnet: "172.22.40.0/24"
+    gateway: "172.22.40.1"
+    dhcp_enabled: true
+    dhcp_start: "172.22.40.100"
+    dhcp_stop: "172.22.40.200"
+    dhcp_lease_seconds: 86400
+    dns:
+      - "1.1.1.1"
+      - "1.0.0.1"
+    client_isolation: false
+    inter_vlan_routing: false
+    igmp_snooping: true
+    dhcp_guard: true
+    description: "Trusted corporate endpoints and workstations"
+
+  - id: 30
+    name: "Guest"
+    purpose: "guest"              # UniFi guest network: portal-ready, auto-isolated
+    subnet: "192.168.77.0/24"
+    gateway: "192.168.77.1"
+    dhcp_enabled: true
+    dhcp_start: "192.168.77.100"
+    dhcp_stop: "192.168.77.200"
+    dhcp_lease_seconds: 3600     # shorter lease for transient clients
+    dns:
+      - "1.1.1.1"
+      - "1.0.0.1"
+    client_isolation: true        # block guest-to-guest traffic
+    inter_vlan_routing: false
+    igmp_snooping: true
+    dhcp_guard: true
+    description: "Untrusted/guest devices - internet access only"
+
+# Port assignment defaults (applied to switches and gateway LAN ports)
+# The deployment tool reads device_profiles.yaml for device-specific overrides.
+port_defaults:
+  management_vlan_native: true   # VLAN 10 is native/untagged on trunk ports
+  trunk_tagged_vlans: [10, 20, 30]
+  access_vlan_map:               # default port->VLAN for access ports (override per-device)
+    1: 20   # port 1 -> Corporate
+    2: 20
+    3: 30   # port 3 -> Guest

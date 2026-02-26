@@ -1,0 +1,78 @@
+# BC10 Deploy Tool - Device Type Profiles
+# Defines how each UniFi device type is configured after adoption.
+
+profiles:
+  # ---- Access Points ----
+  uap:
+    description: "UniFi Access Point"
+    wlan_groups:
+      - ssid: "Corporate"
+        vlan_id: 20
+        security: "wpa2"
+        hidden: false
+        band_steering: true
+        min_rssi_enabled: true
+        min_rssi: -80           # dBm; clients below this are kicked to roam
+        client_isolation: false
+      - ssid: "Guest"
+        vlan_id: 30
+        security: "wpa2"
+        hidden: false
+        band_steering: true
+        client_isolation: true
+        captive_portal: false   # enable manually if a splash page is needed
+
+  # ---- Switches ----
+  usw:
+    description: "UniFi Switch"
+    # Uplink port is auto-detected (highest port index or explicitly tagged as uplink)
+    uplink_port_profile: "trunk_all"
+    default_access_profile: "corporate_access"
+    storm_control: true
+    stp_mode: "rstp"            # rapid STP to prevent loops
+    flow_control: false
+
+  # ---- Cameras ----
+  uvc:
+    description: "UniFi Protect Camera"
+    vlan_id: 10                 # cameras on management VLAN; adjust to a dedicated IoT VLAN if preferred
+    poe_mode: "auto"
+
+  # ---- Gateway / UXG (self) ----
+  uxg:
+    description: "UniFi Gateway (UXG-Max / UXG-Ultra)"
+    # Handled directly by deployment logic; listed here for inventory labelling.
+
+  ugw:
+    description: "UniFi Security Gateway (legacy)"
+    # Same as uxg for our purposes.
+
+# Port profile definitions (created on the controller then applied to switches)
+port_profiles:
+  trunk_all:
+    name: "Trunk-All-VLANs"
+    native_vlan_id: 10          # Management is native (untagged) on trunk
+    tagged_vlan_ids: [20, 30]
+    poe_enabled: false          # trunks typically go to other switches, not PoE devices
+    spanning_tree: true
+
+  corporate_access:
+    name: "Access-Corporate"
+    native_vlan_id: 20
+    tagged_vlan_ids: []
+    poe_enabled: true
+    spanning_tree: true
+
+  guest_access:
+    name: "Access-Guest"
+    native_vlan_id: 30
+    tagged_vlan_ids: []
+    poe_enabled: false
+    spanning_tree: true
+
+  management_access:
+    name: "Access-Management"
+    native_vlan_id: 10
+    tagged_vlan_ids: []
+    poe_enabled: true
+    spanning_tree: true
