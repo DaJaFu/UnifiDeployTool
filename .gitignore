@@ -4,3 +4,6 @@ __pycache__/
 output/
 firmware/
 .env
+docs/SESSION_NOTES.md
+docs/CameraSettings.md
+docs/FirmwareUpgrade.md

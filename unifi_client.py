@@ -42,6 +42,89 @@ class UniFiClient:
         self._csrf_token: str | None = None
 
     # ------------------------------------------------------------------
+    # First-boot setup (factory-default devices only)
+    # ------------------------------------------------------------------
+
+    def check_setup_status(self) -> dict:
+        """
+        Call GET /api/system without authentication.
+        Available on factory-default devices before any account exists.
+        Returns the full system info dict.
+        Key fields: isSetup (bool), deviceState (str), hardware.firmwareVersion (str).
+        Raises UniFiConnectionError if the device is unreachable.
+        """
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/system", timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise UniFiConnectionError(f"Cannot reach {self.base_url}: {exc}") from exc
+        if resp.status_code not in (200, 201):
+            raise UniFiConnectionError(
+                f"GET /api/system returned HTTP {resp.status_code}"
+            )
+        return resp.json()
+
+    def needs_initial_setup(self) -> bool:
+        """Return True if the device is in factory-default / not-yet-configured state."""
+        info = self.check_setup_status()
+        return not info.get("isSetup", True)
+
+    def initial_setup(
+        self,
+        device_name: str,
+        username: str,
+        password: str,
+        country: int = 840,
+        timezone: str | None = None,
+    ) -> dict:
+        """
+        Perform first-boot device setup via POST /api/setup.
+        Only valid when the device has not been configured yet (isSetup=false).
+
+        Args:
+            device_name: Friendly name for the device/site (shown in UniFi dashboard).
+            username:    Local admin username to create.
+            password:    Admin password.
+            country:     ISO 3166-1 numeric country code (default 840 = United States).
+            timezone:    IANA timezone string e.g. "America/New_York" (optional).
+
+        Returns the created user object from the API.
+        Raises UniFiAPIError on failure.
+        """
+        payload: dict = {
+            "name":     device_name,
+            "username": username,
+            "password": password,
+            "country":  country,
+        }
+        if timezone:
+            payload["timezone"] = timezone
+
+        try:
+            resp = self.session.post(
+                f"{self.base_url}/api/setup",
+                json=payload,
+                timeout=self.timeout,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise UniFiConnectionError(f"Cannot reach {self.base_url}: {exc}") from exc
+
+        if resp.status_code not in (200, 201):
+            try:
+                body = resp.json()
+                msg = body.get("message", resp.text[:300])
+            except Exception:
+                msg = resp.text[:300]
+            raise UniFiAPIError(
+                f"Initial setup failed (HTTP {resp.status_code}): {msg}",
+                status_code=resp.status_code,
+            )
+
+        log.debug("Initial setup complete, admin user '%s' created", username)
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
 
@@ -57,7 +140,7 @@ class UniFiClient:
         except requests.exceptions.ConnectionError as exc:
             raise UniFiConnectionError(f"Cannot reach {self.base_url}: {exc}") from exc
 
-        if resp.status_code == 401:
+        if resp.status_code in (401, 403):
             raise UniFiConnectionError("Authentication failed: bad credentials")
 
         if resp.status_code not in (200, 201):
@@ -87,21 +170,27 @@ class UniFiClient:
         """Return UniFi OS system information (firmware, model, etc.)."""
         return self._os_get("/api/system")
 
-    def get_firmware_update_status(self) -> dict:
-        """Check whether a firmware update is available for the gateway itself."""
-        return self._os_get("/api/firmware-update")
+    def get_gateway_product_name(self) -> str:
+        """Return the human-readable product name from /api/system hardware info.
 
-    def trigger_gateway_firmware_update(self) -> dict:
-        """Trigger an OS-level firmware upgrade on the gateway."""
-        return self._os_post("/api/firmware-update", {})
+        e.g. 'UniFi Cloud Gateway Ultra', 'UniFi Dream Machine Pro', etc.
+        Falls back to the shortname model code if the field is unavailable.
+        """
+        try:
+            info = self.get_system_info()
+            hw = info.get("hardware", {})
+            return hw.get("name") or hw.get("shortname") or "UniFi Gateway"
+        except Exception:
+            return "UniFi Gateway"
+
 
     # ------------------------------------------------------------------
     # Network application - devices
     # ------------------------------------------------------------------
 
     def get_devices(self) -> list[dict]:
-        """Return all devices visible to the Network app (adopted + pending)."""
-        data = self._net_get("/stat/device-basic")
+        """Return all devices visible to the Network app (adopted + pending), with full data."""
+        data = self._net_get("/stat/device")
         return data if isinstance(data, list) else []
 
     def get_pending_devices(self) -> list[dict]:
@@ -109,22 +198,11 @@ class UniFiClient:
         data = self._net_get("/stat/device")
         if not isinstance(data, list):
             return []
-        return [d for d in data if d.get("state") == 0]  # 0 = pending adoption
+        return [d for d in data if not d.get("adopted", True)]
 
     def adopt_device(self, mac: str) -> dict:
         """Send an adopt command to a pending device."""
         return self._net_cmd({"cmd": "adopt", "mac": mac.lower()})
-
-    def upgrade_device_firmware(self, mac: str, firmware_url: str | None = None) -> dict:
-        """Upgrade firmware on an adopted device.
-
-        If firmware_url is omitted UniFi will use its CDN (requires internet access).
-        For offline deployments, supply a URL reachable on the local network.
-        """
-        payload: dict = {"cmd": "upgrade", "mac": mac.lower()}
-        if firmware_url:
-            payload["url"] = firmware_url
-        return self._net_cmd(payload)
 
     def wait_for_device(self, mac: str, timeout: int = 120, poll: int = 5) -> dict | None:
         """Poll until a device is connected (state == 1) or timeout expires."""
@@ -190,13 +268,16 @@ class UniFiClient:
     def _net_get(self, path: str) -> list | dict:
         url = f"{self.base_url}{NETWORK_API}{path}"
         resp = self.session.get(url, timeout=self.timeout)
+        log.debug("GET %s response %s: %s", path, resp.status_code, resp.text[:2000])
         self._raise_for_status(resp)
         body = resp.json()
         return body.get("data", body)
 
     def _net_post(self, path: str, payload: dict) -> list | dict:
         url = f"{self.base_url}{NETWORK_API}{path}"
+        log.debug("POST %s payload: %s", path, payload)
         resp = self.session.post(url, json=payload, timeout=self.timeout)
+        log.debug("POST %s response %s: %s", path, resp.status_code, resp.text[:500])
         self._raise_for_status(resp)
         body = resp.json()
         return body.get("data", body)

@@ -1,0 +1,24 @@
+# BC10 Deploy Tool – Initial Setup Configuration
+# -----------------------------------------------
+# Used by main.py --setup to configure a factory-default UniFi gateway
+# before the normal deployment steps run.
+#
+# Usage:
+#   python main.py --setup                         # uses this file
+#   python main.py --setup --setup-config site2.yaml
+#
+# This file is NOT needed if the device is already past the wizard.
+# When --setup is passed, these credentials are also used for Step 1 login.
+
+# ---------------------------------------------------------------------------
+# Admin account to create on the device
+# ---------------------------------------------------------------------------
+admin_username: "admin"
+admin_password: "password"
+
+# ---------------------------------------------------------------------------
+# Device identity
+# ---------------------------------------------------------------------------
+device_name: "My-Gateway"        # shown in the UniFi dashboard
+country: 840                     # ISO 3166-1 numeric (840 = US, 826 = GB)
+timezone: "America/New_York"     # IANA timezone string

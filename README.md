@@ -1,0 +1,146 @@
+# UniFi Deploy Tool
+
+Automated deployment tool for UniFi Gateway (Max/Ultra) networks. Handles first-boot setup, VLAN creation, device adoption, port profile assignment, and inventory export — all from a single CLI command.
+
+---
+
+## What It Does
+
+Runs a 6-step deployment sequence against a UniFi OS gateway:
+
+1. **Initial Setup** — Detects factory-default state and bootstraps the device via the `/api/setup` endpoint (no browser required)
+2. **Connect** — Authenticates with credential fallback (setup creds → defaults → interactive prompt)
+3. **Switch Adoption** — Iteratively discovers and adopts switches in dependency order
+4. **Pre-flight Scan** — Read-only device discovery with state validation; confirms before writing anything
+5. **VLAN Configuration** — Creates VLANs with DHCP, DNS, and gateway settings from `config/vlan_config.yaml`
+6. **Device Adoption** — Adopts pending APs, switches, and cameras with state polling
+7. **Port Profiles** — Creates port profiles and applies them to switches (access ports first, uplink last to prevent adoption loops)
+8. **Inventory Export** — Generates JSON, CSV, and Excel reports to `output/`
+
+Additional utilities:
+- `factory_reset.py` — Safe ordered reset (APs → switches → gateway)
+- `upgrade_firmware.py` — Firmware upgrade via SSH with automatic SSH management
+- `test_ssh_toggle.py` — Test SSH enable/disable endpoints
+
+---
+
+## Installation
+
+**Requirements:** Python 3.9+
+
+```bash
+git clone https://github.com/BC10NetworkTools/UnifiDeployTool.git
+cd UnifiDeployTool
+pip install -r requirements.txt
+```
+
+### Dependencies
+
+| Package | Purpose |
+|---|---|
+| `requests` | HTTP API client |
+| `PyYAML` | Config file parsing |
+| `rich` | CLI tables, progress bars, prompts |
+| `paramiko` | SSH/SFTP for firmware upgrades |
+| `openpyxl` | Excel inventory export |
+
+---
+
+## Configuration
+
+Edit the YAML files in `config/` before running:
+
+- **`config/setup_config.yaml`** — Admin credentials, device name, country code, timezone for first-boot setup
+- **`config/vlan_config.yaml`** — VLAN definitions (ID, name, subnet, DHCP range, purpose)
+- **`config/device_profiles.yaml`** — Port profiles and device type settings
+
+---
+
+## Usage
+
+### Main Deployment
+
+```bash
+# Full deployment (interactive)
+python main.py --host 192.168.1.1
+
+# Dry run — reads device state without making any changes
+python main.py --host 192.168.1.1 --dry-run
+
+# First-boot setup + deployment
+python main.py --host 192.168.1.1 --setup --setup-config config/setup_config.yaml
+
+# With explicit credentials
+python main.py --host 192.168.1.1 --username admin --password yourpassword
+
+# Custom output directory
+python main.py --host 192.168.1.1 --output-dir /path/to/reports
+
+# Debug mode (verbose HTTP logging)
+python main.py --host 192.168.1.1 --debug
+```
+
+### Factory Reset
+
+Resets all adopted devices in safe order (APs → switches → gateway):
+
+```bash
+python factory_reset.py --host 192.168.1.1 --username admin --password yourpassword
+```
+
+### Firmware Upgrade
+
+Upgrades gateway firmware via SSH. Place firmware `.bin` files in `firmware/`:
+
+```bash
+python upgrade_firmware.py --host 192.168.1.1 --username admin --password yourpassword
+
+# Explicit firmware file
+python upgrade_firmware.py --host 192.168.1.1 --username admin --password yourpassword --firmware firmware/UDR.bin
+```
+
+The script automatically enables SSH before upload and disables it after completion.
+
+---
+
+## Deployment Playbook
+
+See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) for the full field deployment guide, including on-site cabling order, modem bridge mode configuration, and UniFi Cloud linking.
+
+---
+
+## Roadmap / To-Dos
+
+From [`docs/improvements.md`](docs/improvements.md):
+
+**Security**
+- [ ] Credential management via OS keyring or Vault (avoid plaintext passwords on CLI)
+- [ ] SSL certificate pinning after first contact
+- [ ] Automatic factory credential rotation post-setup
+- [ ] Firewall rule provisioning (currently VLANs are created but inter-VLAN rules require manual setup)
+- [ ] Signed append-only audit log for regulated environments
+- [ ] VLAN config schema validation (pydantic/cerberus)
+
+**Scalability**
+- [ ] Multi-site / multi-gateway support with a `sites.yaml` manifest
+- [ ] Idempotent re-runs with config drift detection
+- [ ] Non-interactive mode (`--yes` / `--non-interactive` flag) for CI pipelines
+- [ ] AP WLAN provisioning via `/rest/wlangroup` and `/rest/wlan` (currently manual)
+- [ ] Better uplink port detection using API metadata instead of port index heuristics
+- [ ] Deployment state file for crash recovery / resume
+
+**Ease of Use**
+- [ ] Config file path as a CLI argument (`--config`)
+- [ ] Post-deployment verification pass (requery and validate final state)
+- [ ] Structured before/after deployment report
+- [ ] Package as standalone binary (PyInstaller/Nuitka) or Docker container
+- [ ] Disable unused ports as a hardening step (leave one spare Management port)
+
+---
+
+## Notes
+
+- SSL verification is disabled by default (`verify_ssl=False`) since UniFi gateways use self-signed certificates. Pin the cert once known if operating in a higher-trust environment.
+- The `output/` directory is gitignored — inventory reports stay local.
+- Firmware binaries go in `firmware/` which is also gitignored.
+- The first-boot `/api/setup` endpoint was discovered through direct API research on a live UCG Ultra (FW 4.0.6). See [`docs/playwright.md`](docs/playwright.md) for the full discovery notes.
