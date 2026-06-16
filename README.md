@@ -58,6 +58,34 @@ Edit the YAML files in `config/` before running:
 
 ## Usage
 
+### GUI (Windows + Linux)
+
+A cross-platform desktop front-end is available. It scans the local machine's
+network interfaces, auto-detects any UniFi device listening on each interface's
+subnet (labelling it with the product name, e.g. *UniFi Cloud Gateway Ultra*),
+and runs the standard deployment flow with live log output.
+
+```bash
+# Debian/Ubuntu/Mint: system Python is externally managed (PEP 668), so use a venv
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python gui.py
+```
+
+**Linux prerequisite:** since Qt 6.5 the `xcb` platform plugin needs the
+`libxcb-cursor0` system library. On a fresh Debian/Ubuntu/Mint machine the GUI
+aborts with *"Could not load the Qt platform plugin xcb"* until it is installed:
+
+```bash
+sudo apt install libxcb-cursor0
+```
+
+Select the interface with your gateway, enter credentials (or leave blank to try
+defaults), optionally tick **Dry run** / **First-boot setup**, and click
+**Start deployment**. Under the hood the GUI runs `main.py --yes` (non-interactive
+mode), so it never blocks on terminal prompts.
+
 ### Main Deployment
 
 ```bash

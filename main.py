@@ -52,6 +52,11 @@ DEFAULT_PASSWORD = "ubnt"
 console = Console()
 log = logging.getLogger("bc10deploy")
 
+# Non-interactive mode: when True, all confirmation prompts assume their default
+# answer and no stdin input is requested. Set from --yes in main(). Used by the
+# GUI, which passes host + credentials as args and cannot answer stdin prompts.
+ASSUME_YES = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +82,14 @@ def warn(msg: str) -> None:
 
 def fail(msg: str) -> None:
     console.print(f"  [red]✗[/red] {msg}")
+
+
+def confirm(msg: str, default: bool = True) -> bool:
+    """Ask the operator to confirm, or return ``default`` in non-interactive mode."""
+    if ASSUME_YES:
+        console.print(f"  [dim]{msg} → {'yes' if default else 'no'} (auto)[/dim]")
+        return default
+    return Confirm.ask(msg, default=default)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +186,12 @@ def connect_to_gateway(
         ok("Connected with default credentials")
         return client
     except UniFiConnectionError as exc:
+        if ASSUME_YES:
+            # Non-interactive (GUI) mode: cannot prompt for credentials. Fail fast
+            # with a clear message rather than blocking on stdin.
+            fail(f"Could not connect to {host}: {exc}")
+            fail("Supply --username/--password (or --setup) for non-interactive mode.")
+            sys.exit(1)
         if "Authentication failed" in str(exc):
             warn("Default credentials rejected. Prompting for credentials.")
         else:
@@ -268,7 +287,7 @@ def adopt_switches(client: UniFiClient, dry_run: bool) -> None:
         for dev in pending_switches:
             mac = dev.get("mac", "")
             name = dev.get("name") or mac
-            if Confirm.ask(f"  Adopt switch [bold]{name}[/bold] ({mac})?", default=True):
+            if confirm(f"  Adopt switch [bold]{name}[/bold] ({mac})?", default=True):
                 try:
                     client.adopt_device(mac)
                     ok(f"Adoption command sent to {name}")
@@ -380,7 +399,7 @@ def preflight_check(client: UniFiClient) -> None:
                 console.print(f"    [yellow]•[/yellow] {p}")
 
     console.print()
-    if not Confirm.ask("  All devices recognised? Proceed with deployment?", default=True):
+    if not confirm("  All devices recognised? Proceed with deployment?", default=True):
         console.print("\n[yellow]Deployment cancelled.[/yellow]")
         sys.exit(0)
 
@@ -544,7 +563,7 @@ def discover_and_adopt(client: UniFiClient, dry_run: bool) -> list[dict]:
     for dev in pending:
         mac = dev.get("mac", "")
         name = dev.get("name") or mac
-        if Confirm.ask(f"  Adopt [bold]{name}[/bold] ({mac})?", default=True):
+        if confirm(f"  Adopt [bold]{name}[/bold] ({mac})?", default=True):
             try:
                 client.adopt_device(mac)
                 ok(f"Adoption command sent to {name}")
@@ -718,7 +737,7 @@ def apply_vlan_to_ports(
                     })
 
         # Step A: apply access port overrides first
-        if access_overrides and Confirm.ask(
+        if access_overrides and confirm(
             f"  Apply access port profiles to {name}?", default=True
         ):
             try:
@@ -729,7 +748,7 @@ def apply_vlan_to_ports(
                 fail(f"Could not set access ports on {name}: {exc}")
 
         # Step B: apply trunk/uplink overrides last
-        if trunk_overrides and Confirm.ask(
+        if trunk_overrides and confirm(
             f"  Apply trunk port profile to uplink port on {name}? "
             f"[yellow](connectivity may briefly drop)[/yellow]",
             default=True,
@@ -823,11 +842,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--username", default=None, help="Gateway username (skips default credential attempt)")
     p.add_argument("--password", default=None, help="Gateway password")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--yes",
+        "--non-interactive",
+        dest="yes",
+        action="store_true",
+        help="Assume the default answer for all confirmation prompts (no stdin). Used by the GUI.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    global ASSUME_YES
+    ASSUME_YES = args.yes
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.WARNING,
