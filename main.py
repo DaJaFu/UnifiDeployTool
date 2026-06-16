@@ -41,6 +41,7 @@ from rich.table import Table
 
 from unifi_client import UniFiClient, UniFiConnectionError, UniFiAPIError
 import inventory as inv
+import deploy_core
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -90,6 +91,18 @@ def confirm(msg: str, default: bool = True) -> bool:
         console.print(f"  [dim]{msg} → {'yes' if default else 'no'} (auto)[/dim]")
         return default
     return Confirm.ask(msg, default=default)
+
+
+def _console_log(level: str, message: str) -> None:
+    """Map deploy_core log events to the rich console helpers."""
+    if level == "ok":
+        ok(message)
+    elif level == "warn":
+        warn(message)
+    elif level == "fail":
+        fail(message)
+    else:
+        console.print(f"  {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -408,88 +421,10 @@ def preflight_check(client: UniFiClient) -> None:
 # Step 3 – Configure VLANs
 # ---------------------------------------------------------------------------
 
-def _build_network_payload(vlan_cfg: dict, existing_networks: list[dict]) -> dict | None:
-    """Convert a vlan_config.yaml entry to a UniFi API networkconf payload.
-
-    Returns None if the VLAN already exists (matched by VLAN ID).
-    """
-    vlan_id = vlan_cfg["id"]
-    for net in existing_networks:
-        if net.get("vlan") == vlan_id:
-            return None  # already configured
-
-    purpose = vlan_cfg.get("purpose", "corporate")
-    payload: dict = {
-        "name": vlan_cfg["name"],
-        "purpose": purpose,
-        "vlan": vlan_id,
-        "vlan_enabled": True,
-        "networkgroup": "LAN",
-        "igmp_snooping": vlan_cfg.get("igmp_snooping", True),
-        # dhcpguard_enabled omitted: enabling it requires a trusted DHCP server IP
-        # which the API enforces at creation time (api.err.MissingIPAddress).
-    }
-
-    # Add L3/DHCP config (not needed for pure VLAN-only networks)
-    if vlan_cfg.get("dhcp_enabled"):
-        gw = vlan_cfg["gateway"]
-        # UniFi expects "x.x.x.x/prefix" format using the gateway IP
-        prefix = vlan_cfg["subnet"].split("/")[1]
-        payload["ip_subnet"] = f"{gw}/{prefix}"
-        payload["dhcpd_enabled"] = True
-        payload["dhcpd_start"] = vlan_cfg["dhcp_start"]
-        payload["dhcpd_stop"] = vlan_cfg["dhcp_stop"]
-        payload["dhcpd_leasetime"] = vlan_cfg.get("dhcp_lease_seconds", 86400)
-        dns = vlan_cfg.get("dns", ["1.1.1.1"])
-        payload["dhcpd_dns_1"] = dns[0] if len(dns) > 0 else "1.1.1.1"
-        if len(dns) > 1:
-            payload["dhcpd_dns_2"] = dns[1]
-
-    if purpose == "guest":
-        payload["ap_isolation"] = vlan_cfg.get("client_isolation", True)
-
-    return payload
-
-
 def configure_vlans(client: UniFiClient, vlan_configs: list[dict], dry_run: bool) -> dict[int, dict]:
     """Create VLANs on the controller.  Returns map of vlan_id -> network object."""
     step_header("Step 3 · Configure VLANs")
-
-    existing = [] if dry_run else client.get_networks()
-    network_map: dict[int, dict] = {}
-
-    # Pre-populate existing entries
-    for net in existing:
-        vid = net.get("vlan")
-        if vid:
-            network_map[vid] = net
-
-    for vcfg in vlan_configs:
-        vlan_id = vcfg["id"]
-        name = vcfg["name"]
-
-        if vlan_id in network_map:
-            warn(f"VLAN {vlan_id} ({name}) already exists – skipping creation")
-            continue
-
-        payload = _build_network_payload(vcfg, existing)
-        if payload is None:
-            warn(f"VLAN {vlan_id} ({name}) already exists – skipping")
-            continue
-
-        if dry_run:
-            ok(f"[DRY RUN] Would create VLAN {vlan_id} – {name}")
-            network_map[vlan_id] = {"_id": f"dry-run-{vlan_id}", "vlan": vlan_id, **payload}
-            continue
-
-        try:
-            created = client.create_network(payload)
-            network_map[vlan_id] = created
-            ok(f"Created VLAN {vlan_id} – {name}  (id={created.get('_id', '?')})")
-        except UniFiAPIError as exc:
-            fail(f"Failed to create VLAN {vlan_id} ({name}): {exc}")
-
-    return network_map
+    return deploy_core.sync_vlans(client, vlan_configs, dry_run, log=_console_log)
 
 
 # ---------------------------------------------------------------------------
@@ -613,43 +548,9 @@ def _get_or_create_port_profile(client: UniFiClient, profile_def: dict,
                                   existing_profiles: list[dict],
                                   network_map: dict[int, dict]) -> str | None:
     """Find or create a port profile.  Returns the profile _id."""
-    profile_name = profile_def["name"]
-
-    # Check if it already exists
-    for p in existing_profiles:
-        if p.get("name") == profile_name:
-            return p["_id"]
-
-    native_vlan_id = profile_def.get("native_vlan_id")
-    tagged_vlan_ids: list[int] = profile_def.get("tagged_vlan_ids", [])
-
-    native_net = network_map.get(native_vlan_id)
-    if not native_net:
-        warn(f"Network for native VLAN {native_vlan_id} not found; skipping profile '{profile_name}'")
-        return None
-
-    tagged_ids = []
-    for vid in tagged_vlan_ids:
-        net = network_map.get(vid)
-        if net:
-            tagged_ids.append(net["_id"])
-        else:
-            warn(f"  Network for tagged VLAN {vid} not found; omitting from '{profile_name}'")
-
-    payload = {
-        "name": profile_name,
-        "forward": "customize",
-        "op_mode": "switch",
-        "native_networkconf_id": native_net["_id"],
-        "tagged_networkconf_ids": tagged_ids,
-    }
-
-    try:
-        created = client.create_port_profile(payload)
-        return created.get("_id")
-    except UniFiAPIError as exc:
-        fail(f"Could not create port profile '{profile_name}': {exc}")
-        return None
+    return deploy_core.ensure_port_profile(
+        client, profile_def, existing_profiles, network_map, log=_console_log
+    )
 
 
 def apply_vlan_to_ports(
