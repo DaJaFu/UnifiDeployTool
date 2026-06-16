@@ -6,10 +6,12 @@ Navigation:
   • Scan Interfaces page (launch point) - lists the local machine's network
     interfaces and detects any UniFi device listening on each subnet.
   • Select a detected device -> a login dialog pops up. Leave the fields blank to
-    let the tool try the device defaults.
-  • The app then switches to the Deployment page, where the standard flow runs
-    (main.py in non-interactive --yes mode) with live log output. The ✕ button at
-    the top-right returns to the Scan Interfaces page at any time.
+    let the tool try the device defaults. The connection is verified before the
+    dialog accepts, and the authenticated session is kept alive.
+  • The Configure Devices page lists every device on the gateway with a dropdown
+    to choose a port profile per switch. "Deploy" currently simulates the push
+    (dry-run); real API writes come once the config editor lands. The ✕ button at
+    the top-right logs out and returns to the Scan Interfaces page.
 
 Run:  python gui.py        (after: pip install -r requirements.txt)
 """
@@ -19,11 +21,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QThread, Signal
+import yaml
+
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -32,7 +36,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QStackedWidget,
@@ -46,14 +49,48 @@ import detect
 from unifi_client import UniFiClient, UniFiConnectionError
 
 PROJECT_DIR = Path(__file__).resolve().parent
+DEVICE_PROFILES_PATH = PROJECT_DIR / "config" / "device_profiles.yaml"
 
 # Factory default credentials (mirror main.DEFAULT_USERNAME / DEFAULT_PASSWORD).
 DEFAULT_USERNAME = "ubnt"
 DEFAULT_PASSWORD = "ubnt"
 
+# Device types a port profile can be applied to today (switches).
+APPLICABLE_TYPES = {"usw"}
+
+DEVICE_TYPE_LABELS = {
+    "usw": "Switch",
+    "uap": "Access Point",
+    "uvc": "Camera",
+    "udm": "Gateway",
+    "uxg": "Gateway",
+    "ugw": "Gateway",
+    "ucg": "Gateway",
+}
+
+STATE_LABELS = {
+    0: "Disconnected",
+    1: "Connected",
+    2: "Pending Adoption",
+    4: "Upgrading",
+    5: "Provisioning",
+    6: "Heartbeat Missed",
+    7: "Adopting",
+    10: "Adopt Failed",
+}
+
+
+def load_port_profiles() -> dict:
+    """Return the port_profiles mapping {key: definition} from device_profiles.yaml."""
+    try:
+        data = yaml.safe_load(DEVICE_PROFILES_PATH.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data.get("port_profiles", {}) or {}
+
 
 # ---------------------------------------------------------------------------
-# Background interface scan (keeps the UI responsive)
+# Background workers (keep the UI responsive during network I/O)
 # ---------------------------------------------------------------------------
 
 class ScanWorker(QThread):
@@ -70,13 +107,13 @@ class ScanWorker(QThread):
 class ConnectWorker(QThread):
     """Validates the connection/credentials off the UI thread before navigating.
 
-    For a configured device this attempts an actual login (provided credentials,
-    or factory defaults when blank). For a factory-default device there is no
-    account yet, so it only confirms the device is reachable — first-boot setup
-    will create the admin account during deployment.
+    For a configured device this performs a real login (provided credentials, or
+    factory defaults when blank) and, on success, hands back the authenticated
+    client so later pages can reuse the session. For a factory-default device
+    there is no account yet, so it only confirms reachability (client is None).
     """
 
-    done = Signal(bool, str)   # success, message
+    done = Signal(bool, str, object)   # success, message, client | None
 
     def __init__(self, host: str, username: str, password: str, configured: bool) -> None:
         super().__init__()
@@ -94,6 +131,7 @@ class ConnectWorker(QThread):
                     True,
                     "Device reachable — factory-default state. First-boot setup "
                     "will create the admin account during deployment.",
+                    None,
                 )
                 return
 
@@ -105,14 +143,30 @@ class ConnectWorker(QThread):
             try:
                 client.login(user, pwd)
             except UniFiConnectionError as exc:
-                self.done.emit(False, f"Login failed: {exc}")
+                self.done.emit(False, f"Login failed: {exc}", None)
                 return
-            client.logout()
-            self.done.emit(True, f"Authenticated as '{user}'.")
+            self.done.emit(True, f"Authenticated as '{user}'.", client)
         except UniFiConnectionError as exc:
-            self.done.emit(False, f"Cannot reach {self.host}: {exc}")
+            self.done.emit(False, f"Cannot reach {self.host}: {exc}", None)
         except Exception as exc:   # noqa: BLE001 - surface anything unexpected to the user
-            self.done.emit(False, str(exc))
+            self.done.emit(False, str(exc), None)
+
+
+class DeviceLoadWorker(QThread):
+    """Fetches the device list off the UI thread."""
+
+    loaded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, client: UniFiClient) -> None:
+        super().__init__()
+        self.client = client
+
+    def run(self) -> None:
+        try:
+            self.loaded.emit(self.client.get_devices())
+        except Exception as exc:   # noqa: BLE001
+            self.failed.emit(str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +177,9 @@ class LoginDialog(QDialog):
     """Collects credentials and verifies the connection before accepting.
 
     Blank username/password fall back to the device defaults. The dialog only
-    accepts (allowing navigation to the deployment page) once the connection has
-    been confirmed; on failure it stays open and shows the error.
+    accepts (allowing navigation) once the connection has been confirmed; on
+    failure it stays open and shows the error. On success the authenticated
+    client (or None for a reachable factory device) is exposed as ``.client``.
     """
 
     def __init__(self, device_label: str, host: str, configured: bool, parent=None) -> None:
@@ -133,6 +188,7 @@ class LoginDialog(QDialog):
         self.setModal(True)
         self._configured = configured
         self._worker: ConnectWorker | None = None
+        self.client: UniFiClient | None = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(f"<b>{device_label}</b>"))
@@ -196,9 +252,10 @@ class LoginDialog(QDialog):
         self._worker.done.connect(self._on_verified)
         self._worker.start()
 
-    def _on_verified(self, success: bool, message: str) -> None:
+    def _on_verified(self, success: bool, message: str, client) -> None:
         self._set_busy(False)
         if success:
+            self.client = client
             self.status.setText(f"<span style='color:#0a0;'>{message}</span>")
             self.accept()
         else:
@@ -320,168 +377,187 @@ class ScanPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Page 2 · Deployment
+# Page 2 · Configure Devices
 # ---------------------------------------------------------------------------
 
-class DeployPage(QWidget):
-    """Runs main.py for the chosen device and streams its output."""
+class ConfigPage(QWidget):
+    """Lists gateway devices and assigns a port profile per switch, then deploys."""
 
     back_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._process: QProcess | None = None
-        self._host = ""
-        self._username = ""
-        self._password = ""
+        self._client: UniFiClient | None = None
+        self._loader: DeviceLoadWorker | None = None
+        self._profiles = load_port_profiles()          # {key: definition}
+        self._rows: list[tuple[dict, QComboBox]] = []   # applicable (device, combo)
 
         layout = QVBoxLayout(self)
 
-        # Header: device label (left) + close/back button (top-right)
+        # Header: title (left) + refresh + close/back (top-right)
         header = QHBoxLayout()
-        self.title = QLabel("<h2>Deployment</h2>")
+        self.title = QLabel("<h2>Configure Devices</h2>")
         header.addWidget(self.title)
         header.addStretch(1)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setToolTip("Re-fetch the device list from the gateway")
+        self.refresh_btn.clicked.connect(self._load_devices)
+        header.addWidget(self.refresh_btn, alignment=Qt.AlignTop)
         self.back_btn = QPushButton("✕")
-        self.back_btn.setToolTip("Return to Scan Interfaces")
+        self.back_btn.setToolTip("Log out and return to Scan Interfaces")
         self.back_btn.setFixedSize(32, 28)
-        self.back_btn.clicked.connect(self._go_back)
+        self.back_btn.clicked.connect(self.back_requested.emit)
         header.addWidget(self.back_btn, alignment=Qt.AlignTop)
         layout.addLayout(header)
 
-        # Options
-        opts = QHBoxLayout()
-        self.setup_check = QCheckBox("First-boot setup (config/setup_config.yaml)")
-        self.dryrun_check = QCheckBox("Dry run (simulate, no changes)")
-        opts.addWidget(self.setup_check)
-        opts.addWidget(self.dryrun_check)
-        opts.addStretch(1)
-        layout.addLayout(opts)
+        self.status = QLabel("")
+        layout.addWidget(self.status)
 
-        # Run controls
-        buttons = QHBoxLayout()
-        self.start_btn = QPushButton("Start deployment")
-        self.start_btn.clicked.connect(self.start_deployment)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_deployment)
-        self.run_status = QLabel("Idle.")
-        buttons.addWidget(self.start_btn)
-        buttons.addWidget(self.stop_btn)
-        buttons.addWidget(self.run_status, stretch=1)
-        layout.addLayout(buttons)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Device", "Type", "IP", "State", "Config profile"]
+        )
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        layout.addWidget(self.table, stretch=1)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFont(QFont("monospace"))
-        layout.addWidget(self.log, stretch=1)
+        controls = QHBoxLayout()
+        self.deploy_btn = QPushButton("Deploy")
+        self.deploy_btn.setEnabled(False)
+        self.deploy_btn.clicked.connect(self.deploy)
+        controls.addWidget(self.deploy_btn)
+        controls.addWidget(QLabel("Assign a profile to every switch to enable Deploy."))
+        controls.addStretch(1)
+        layout.addLayout(controls)
 
-    # -- configuration from the login step ------------------------------
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setFont(QFont("monospace"))
+        self.output.setMaximumHeight(200)
+        layout.addWidget(self.output)
 
-    def configure(self, host: str, username: str, password: str, label: str) -> None:
-        self._host = host
-        self._username = username
-        self._password = password
-        self.title.setText(f"<h2>Deployment</h2><span>{label}</span>")
-        self.run_status.setText("Idle.")
-        self.log.clear()
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+    # -- session handoff -------------------------------------------------
 
-    # -- navigation ------------------------------------------------------
+    def set_client(self, client: UniFiClient | None, label: str) -> None:
+        self._client = client
+        self.title.setText(f"<h2>Configure Devices</h2><span>{label}</span>")
+        self.output.clear()
+        self._load_devices()
 
-    def _is_running(self) -> bool:
-        return self._process is not None and self._process.state() != QProcess.NotRunning
+    # -- device loading --------------------------------------------------
 
-    def _go_back(self) -> None:
-        if self._is_running():
-            reply = QMessageBox.question(
-                self,
-                "Stop deployment?",
-                "A deployment is still running. Stop it and return to Scan Interfaces?",
+    def _load_devices(self) -> None:
+        self._rows = []
+        self.table.setRowCount(0)
+        self.deploy_btn.setEnabled(False)
+
+        if self._client is None:
+            self.status.setText(
+                "No authenticated session (factory-default device). "
+                "Complete first-boot setup before configuring devices."
             )
-            if reply != QMessageBox.Yes:
-                return
-            self._process.kill()
-            self._process.waitForFinished(2000)
-        self.back_requested.emit()
-
-    # -- running main.py -------------------------------------------------
-
-    def start_deployment(self) -> None:
-        if self._is_running() or not self._host:
+            self.refresh_btn.setEnabled(False)
             return
 
-        args = ["main.py", "--host", self._host, "--yes"]
-        if self._username:
-            args += ["--username", self._username]
-        if self._password:
-            args += ["--password", self._password]
-        if self.setup_check.isChecked():
-            args += ["--setup"]
-        if self.dryrun_check.isChecked():
-            args += ["--dry-run"]
+        self.refresh_btn.setEnabled(False)
+        self.status.setText("Loading devices…")
+        self._loader = DeviceLoadWorker(self._client)
+        self._loader.loaded.connect(self._on_devices_loaded)
+        self._loader.failed.connect(self._on_load_failed)
+        self._loader.start()
 
-        self.log.clear()
-        self._append_log(f"$ {sys.executable} {' '.join(args)}\n")
+    def _on_load_failed(self, message: str) -> None:
+        self.refresh_btn.setEnabled(True)
+        self.status.setText(f"Failed to load devices: {message}")
 
-        self._process = QProcess(self)
-        self._process.setWorkingDirectory(str(PROJECT_DIR))
-        self._process.setProcessChannelMode(QProcess.MergedChannels)
-        self._process.readyReadStandardOutput.connect(self._on_process_output)
-        self._process.finished.connect(self._on_process_finished)
-        self._process.errorOccurred.connect(
-            lambda err: self._append_log(f"\n[process error: {err}]\n")
+    def _on_devices_loaded(self, devices: list) -> None:
+        self.refresh_btn.setEnabled(True)
+        self._rows = []
+        self.table.setRowCount(len(devices))
+
+        for row, dev in enumerate(devices):
+            dtype = dev.get("type", "")
+            name = dev.get("name") or dev.get("mac", "?")
+            state = STATE_LABELS.get(dev.get("state"), str(dev.get("state", "?")))
+
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem(DEVICE_TYPE_LABELS.get(dtype, dtype or "?")))
+            self.table.setItem(row, 2, QTableWidgetItem(dev.get("ip", "—")))
+            self.table.setItem(row, 3, QTableWidgetItem(state))
+
+            combo = QComboBox()
+            if dtype in APPLICABLE_TYPES and self._profiles:
+                combo.addItem("— select —", None)
+                for key, definition in self._profiles.items():
+                    combo.addItem(definition.get("name", key), key)
+                combo.currentIndexChanged.connect(self._update_deploy_enabled)
+                self._rows.append((dev, combo))
+            else:
+                reason = "no profiles loaded" if dtype in APPLICABLE_TYPES else "not yet supported"
+                combo.addItem(f"n/a ({reason})", None)
+                combo.setEnabled(False)
+            self.table.setCellWidget(row, 4, combo)
+
+        configurable = len(self._rows)
+        self.status.setText(
+            f"{len(devices)} device(s) · {configurable} configurable switch(es)."
         )
+        self._update_deploy_enabled()
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.run_status.setText("Running…")
-        self._process.start(sys.executable, args)
+    def _update_deploy_enabled(self) -> None:
+        ready = bool(self._rows) and all(
+            combo.currentData() is not None for _, combo in self._rows
+        )
+        self.deploy_btn.setEnabled(ready)
 
-    def stop_deployment(self) -> None:
-        if self._is_running():
-            self._process.kill()
+    # -- deploy (dry-run simulation) ------------------------------------
 
-    def _on_process_output(self) -> None:
-        data = bytes(self._process.readAllStandardOutput()).decode(errors="replace")
-        self._append_log(data)
-
-    def _on_process_finished(self, exit_code: int, _status) -> None:
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        if exit_code == 0:
-            self.run_status.setText("Finished successfully.")
-        else:
-            self.run_status.setText(f"Exited with code {exit_code}.")
-
-    def _append_log(self, text: str) -> None:
-        self.log.moveCursor(self.log.textCursor().End)
-        self.log.insertPlainText(text)
-        self.log.moveCursor(self.log.textCursor().End)
+    def deploy(self) -> None:
+        self.output.clear()
+        self.output.appendPlainText(
+            "[DRY RUN] Simulating deployment — no changes will be pushed to the gateway.\n"
+        )
+        for dev, combo in self._rows:
+            key = combo.currentData()
+            definition = self._profiles.get(key, {})
+            name = dev.get("name") or dev.get("mac", "?")
+            native = definition.get("native_vlan_id", "?")
+            tagged = definition.get("tagged_vlan_ids", []) or []
+            self.output.appendPlainText(
+                f"  • {name} ({dev.get('mac', '?')}) → '{definition.get('name', key)}'"
+                f"  [native VLAN {native}, tagged {tagged}]"
+            )
+        self.output.appendPlainText(
+            f"\nSimulated {len(self._rows)} switch(es). "
+            "Live push will be wired up after the config editor."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Main window — hosts the two pages
+# Main window — hosts the pages and owns the authenticated session
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("UniFi Deploy Tool")
-        self.resize(840, 720)
+        self.resize(900, 760)
+
+        self._client: UniFiClient | None = None
 
         self.stack = QStackedWidget()
         self.scan_page = ScanPage()
-        self.deploy_page = DeployPage()
+        self.config_page = ConfigPage()
         self.stack.addWidget(self.scan_page)
-        self.stack.addWidget(self.deploy_page)
+        self.stack.addWidget(self.config_page)
         self.setCentralWidget(self.stack)
 
         self.scan_page.connect_requested.connect(self._open_login)
-        self.deploy_page.back_requested.connect(
-            lambda: self.stack.setCurrentWidget(self.scan_page)
-        )
+        self.config_page.back_requested.connect(self._back_to_scan)
 
         # The scan page is the launch point — kick off a scan immediately.
         self.scan_page.start_scan()
@@ -495,11 +571,27 @@ class MainWindow(QMainWindow):
         dialog = LoginDialog(label, host, configured, self)
         if dialog.exec() != QDialog.Accepted:
             return
-        host, username, password = dialog.values()
-        if not host:
-            return
-        self.deploy_page.configure(host, username, password, label)
-        self.stack.setCurrentWidget(self.deploy_page)
+
+        self._set_client(dialog.client)
+        self.config_page.set_client(self._client, label)
+        self.stack.setCurrentWidget(self.config_page)
+
+    def _set_client(self, client: UniFiClient | None) -> None:
+        """Adopt a new session, logging out any previous one first."""
+        if self._client is not None and self._client is not client:
+            try:
+                self._client.logout()
+            except Exception:   # noqa: BLE001 - best-effort cleanup
+                pass
+        self._client = client
+
+    def _back_to_scan(self) -> None:
+        self._set_client(None)
+        self.stack.setCurrentWidget(self.scan_page)
+
+    def closeEvent(self, event) -> None:   # noqa: N802 - Qt override
+        self._set_client(None)
+        super().closeEvent(event)
 
 
 def main() -> None:

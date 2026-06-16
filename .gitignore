@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+run_gui.sh
+run_gui.bat
 output/
 firmware/
 .env

@@ -63,7 +63,8 @@ Edit the YAML files in `config/` before running:
 A cross-platform desktop front-end is available. It scans the local machine's
 network interfaces, auto-detects any UniFi device listening on each interface's
 subnet (labelling it with the product name, e.g. *UniFi Cloud Gateway Ultra*),
-and runs the standard deployment flow with live log output.
+verifies the connection, then lets you assign a port profile per switch before
+deploying.
 
 ```bash
 # Debian/Ubuntu/Mint: system Python is externally managed (PEP 668), so use a venv
@@ -81,10 +82,18 @@ aborts with *"Could not load the Qt platform plugin xcb"* until it is installed:
 sudo apt install libxcb-cursor0
 ```
 
-Select the interface with your gateway, enter credentials (or leave blank to try
-defaults), optionally tick **Dry run** / **First-boot setup**, and click
-**Start deployment**. Under the hood the GUI runs `main.py --yes` (non-interactive
-mode), so it never blocks on terminal prompts.
+Pick the interface with your gateway and click **Connect**; enter credentials in
+the popup (or leave them blank to try the device defaults). The connection is
+verified before continuing. The **Configure Devices** page then lists every
+device on the gateway, with a dropdown to choose a port profile
+(from `config/device_profiles.yaml`) for each switch. Press **Deploy** to apply.
+
+> **Note:** Deploy currently runs a dry-run simulation (it logs what would be
+> pushed per device); live API writes and an in-app config editor are in
+> progress. The ✕ at the top-right logs out and returns to the scan page.
+
+The full automated CLI flow (VLAN creation, adoption, port profiles, inventory)
+remains available via `python main.py` — see **Main Deployment** below.
 
 ### Main Deployment
 
