@@ -21,12 +21,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import yaml
-
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -35,21 +34,26 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
+import config_io
 import detect
 from unifi_client import UniFiClient, UniFiConnectionError
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEVICE_PROFILES_PATH = PROJECT_DIR / "config" / "device_profiles.yaml"
 
 # Factory default credentials (mirror main.DEFAULT_USERNAME / DEFAULT_PASSWORD).
 DEFAULT_USERNAME = "ubnt"
@@ -83,8 +87,8 @@ STATE_LABELS = {
 def load_port_profiles() -> dict:
     """Return the port_profiles mapping {key: definition} from device_profiles.yaml."""
     try:
-        data = yaml.safe_load(DEVICE_PROFILES_PATH.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+        data = config_io.load_device_profiles() or {}
+    except Exception:   # noqa: BLE001 - missing/invalid file → empty set
         return {}
     return data.get("port_profiles", {}) or {}
 
@@ -377,6 +381,262 @@ class ScanPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Config editor (modal) — structured editing of the YAML profiles
+# ---------------------------------------------------------------------------
+
+class ProfileEditorDialog(QDialog):
+    """Structured editor for the config profiles.
+
+    Tabbed by device class (Switches / Gateway / APs / Cameras). Only the Port
+    Profiles tab (switches) is implemented today; the rest are placeholders that
+    reserve space for VLANs, WLANs, and a future UniFi Protect integration.
+    Saving writes back via ruamel round-trip so comments/structure are preserved.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit configuration profiles")
+        self.setModal(True)
+        self.resize(680, 440)
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+
+        try:
+            self._doc = config_io.load_device_profiles()
+        except Exception as exc:   # noqa: BLE001
+            self._doc = None
+            layout.addWidget(QLabel(f"Could not load device_profiles.yaml:\n{exc}"))
+            box = QDialogButtonBox(QDialogButtonBox.Close)
+            box.rejected.connect(self.reject)
+            layout.addWidget(box)
+            return
+
+        if not isinstance(self._doc.get("port_profiles"), CommentedMap):
+            self._doc["port_profiles"] = CommentedMap()
+        self._profiles = self._doc["port_profiles"]
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_port_tab(), "Port Profiles (Switches)")
+        tabs.addTab(self._placeholder(
+            "VLANs / Networks — Gateway",
+            "Editing VLANs (config/vlan_config.yaml) is coming next.",
+        ), "VLANs (Gateway)")
+        tabs.addTab(self._placeholder(
+            "WLANs / SSIDs — Access Points",
+            "Editing WLANs is coming next. Pushing them to APs also needs the "
+            "wlangroup/wlan endpoints, which aren't implemented yet "
+            "(see docs/improvements.md).",
+        ), "WLANs (APs)")
+        cam_idx = tabs.addTab(self._placeholder(
+            "Cameras / NVR — UniFi Protect",
+            "UniFi Protect devices use a separate API (/proxy/protect) and can't "
+            "be configured through this tool yet. Flagged to investigate later.",
+        ), "Cameras / NVR")
+        tabs.setTabEnabled(cam_idx, False)
+        layout.addWidget(tabs)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self._save)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._reload_list()
+
+    # -- tab builders ---------------------------------------------------
+
+    @staticmethod
+    def _placeholder(title: str, body: str) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        head = QLabel(f"<b>{title}</b>")
+        text = QLabel(body)
+        text.setWordWrap(True)
+        text.setStyleSheet("color: gray;")
+        v.addWidget(head)
+        v.addWidget(text)
+        v.addStretch(1)
+        return w
+
+    def _build_port_tab(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+
+        left = QVBoxLayout()
+        self.list = QListWidget()
+        self.list.currentItemChanged.connect(self._on_select)
+        left.addWidget(self.list)
+        row = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add)
+        dup_btn = QPushButton("Duplicate")
+        dup_btn.clicked.connect(self._duplicate)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self._delete)
+        row.addWidget(add_btn)
+        row.addWidget(dup_btn)
+        row.addWidget(del_btn)
+        left.addLayout(row)
+        h.addLayout(left, 1)
+
+        self.form_wrap = QWidget()
+        form = QFormLayout(self.form_wrap)
+        self.name_edit = QLineEdit()
+        self.name_edit.textChanged.connect(self._on_field_change)
+        self.native_spin = QSpinBox()
+        self.native_spin.setRange(1, 4094)
+        self.native_spin.valueChanged.connect(self._on_field_change)
+        self.tagged_edit = QLineEdit()
+        self.tagged_edit.setPlaceholderText("e.g. 20, 30")
+        self.tagged_edit.textChanged.connect(self._on_field_change)
+        self.poe_check = QCheckBox()
+        self.poe_check.toggled.connect(self._on_field_change)
+        self.stp_check = QCheckBox()
+        self.stp_check.toggled.connect(self._on_field_change)
+        form.addRow("Name", self.name_edit)
+        form.addRow("Native VLAN", self.native_spin)
+        form.addRow("Tagged VLANs", self.tagged_edit)
+        form.addRow("PoE enabled", self.poe_check)
+        form.addRow("Spanning tree", self.stp_check)
+        self.err = QLabel("")
+        self.err.setWordWrap(True)
+        self.err.setStyleSheet("color:#b00;")
+        form.addRow("", self.err)
+        h.addWidget(self.form_wrap, 2)
+        self.form_wrap.setEnabled(False)
+        return w
+
+    # -- profile list management ----------------------------------------
+
+    def _reload_list(self) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for key, prof in self._profiles.items():
+            item = QListWidgetItem((prof or {}).get("name", key))
+            item.setData(Qt.UserRole, key)
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        else:
+            self.form_wrap.setEnabled(False)
+
+    def _current_key(self) -> str | None:
+        item = self.list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _unique_key(self, base: str) -> str:
+        base = base or "profile"
+        key, i = base, 2
+        while key in self._profiles:
+            key, i = f"{base}_{i}", i + 1
+        return key
+
+    def _on_select(self, current, _previous) -> None:
+        if current is None:
+            self.form_wrap.setEnabled(False)
+            return
+        prof = self._profiles.get(current.data(Qt.UserRole)) or {}
+        self._loading = True
+        self.name_edit.setText(str(prof.get("name", current.data(Qt.UserRole))))
+        self.native_spin.setValue(int(prof.get("native_vlan_id", 1) or 1))
+        tagged = prof.get("tagged_vlan_ids") or []
+        self.tagged_edit.setText(", ".join(str(v) for v in tagged))
+        self.poe_check.setChecked(bool(prof.get("poe_enabled", False)))
+        self.stp_check.setChecked(bool(prof.get("spanning_tree", True)))
+        self._loading = False
+        self.err.setText("")
+        self.form_wrap.setEnabled(True)
+
+    @staticmethod
+    def _parse_tagged(text: str) -> list[int]:
+        out: list[int] = []
+        for part in text.replace(",", " ").split():
+            n = int(part)
+            if not 1 <= n <= 4094:
+                raise ValueError(f"{n} out of range")
+            out.append(n)
+        return out
+
+    def _on_field_change(self, *_) -> None:
+        if self._loading:
+            return
+        key = self._current_key()
+        if key is None:
+            return
+        prof = self._profiles.get(key)
+        if not isinstance(prof, CommentedMap):
+            prof = CommentedMap()
+            self._profiles[key] = prof
+
+        prof["name"] = self.name_edit.text()
+        prof["native_vlan_id"] = self.native_spin.value()
+        try:
+            seq = CommentedSeq(self._parse_tagged(self.tagged_edit.text()))
+            seq.fa.set_flow_style()
+            prof["tagged_vlan_ids"] = seq
+            self.err.setText("")
+        except ValueError:
+            self.err.setText("Tagged VLANs must be comma-separated numbers (1–4094).")
+        prof["poe_enabled"] = self.poe_check.isChecked()
+        prof["spanning_tree"] = self.stp_check.isChecked()
+
+        item = self.list.currentItem()
+        if item:
+            item.setText(self.name_edit.text() or key)
+
+    def _add(self) -> None:
+        key = self._unique_key("new_profile")
+        prof = CommentedMap()
+        prof["name"] = "New Profile"
+        prof["native_vlan_id"] = 1
+        seq = CommentedSeq()
+        seq.fa.set_flow_style()
+        prof["tagged_vlan_ids"] = seq
+        prof["poe_enabled"] = False
+        prof["spanning_tree"] = True
+        self._profiles[key] = prof
+        item = QListWidgetItem(prof["name"])
+        item.setData(Qt.UserRole, key)
+        self.list.addItem(item)
+        self.list.setCurrentItem(item)
+        self.name_edit.setFocus()
+        self.name_edit.selectAll()
+
+    def _duplicate(self) -> None:
+        from copy import deepcopy
+        key = self._current_key()
+        if key is None:
+            return
+        src = self._profiles.get(key) or CommentedMap()
+        new_key = self._unique_key(f"{key}_copy")
+        prof = deepcopy(src)
+        prof["name"] = f"{src.get('name', key)} (copy)"
+        self._profiles[new_key] = prof
+        item = QListWidgetItem(prof["name"])
+        item.setData(Qt.UserRole, new_key)
+        self.list.addItem(item)
+        self.list.setCurrentItem(item)
+
+    def _delete(self) -> None:
+        key = self._current_key()
+        if key is None:
+            return
+        self._profiles.pop(key, None)
+        self.list.takeItem(self.list.currentRow())
+        if self.list.count() == 0:
+            self.form_wrap.setEnabled(False)
+
+    def _save(self) -> None:
+        try:
+            config_io.save_device_profiles(self._doc)
+        except Exception as exc:   # noqa: BLE001
+            self.err.setText(f"Save failed: {exc}")
+            return
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # Page 2 · Configure Devices
 # ---------------------------------------------------------------------------
 
@@ -399,6 +659,10 @@ class ConfigPage(QWidget):
         self.title = QLabel("<h2>Configure Devices</h2>")
         header.addWidget(self.title)
         header.addStretch(1)
+        self.edit_btn = QPushButton("Edit profiles…")
+        self.edit_btn.setToolTip("Edit the port profiles applied to switches")
+        self.edit_btn.clicked.connect(self._open_editor)
+        header.addWidget(self.edit_btn, alignment=Qt.AlignTop)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip("Re-fetch the device list from the gateway")
         self.refresh_btn.clicked.connect(self._load_devices)
@@ -513,6 +777,28 @@ class ConfigPage(QWidget):
             combo.currentData() is not None for _, combo in self._rows
         )
         self.deploy_btn.setEnabled(ready)
+
+    # -- profile editing -------------------------------------------------
+
+    def _open_editor(self) -> None:
+        dialog = ProfileEditorDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            self.reload_profiles()
+
+    def reload_profiles(self) -> None:
+        """Re-read profiles and refresh each switch dropdown, keeping selections."""
+        self._profiles = load_port_profiles()
+        for _dev, combo in self._rows:
+            prev_key = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— select —", None)
+            for key, definition in self._profiles.items():
+                combo.addItem(definition.get("name", key), key)
+            idx = combo.findData(prev_key)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self._update_deploy_enabled()
 
     # -- deploy (dry-run simulation) ------------------------------------
 
