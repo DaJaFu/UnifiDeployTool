@@ -19,6 +19,7 @@ Run:  python gui.py        (after: pip install -r requirements.txt)
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -51,7 +53,7 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 import config_io
 import detect
-from unifi_client import UniFiClient, UniFiConnectionError
+from unifi_client import UniFiClient, UniFiConnectionError, UniFiAPIError
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -72,6 +74,8 @@ DEVICE_TYPE_LABELS = {
     "ucg": "Gateway",
 }
 
+GATEWAY_TYPES = {"udm", "uxg", "ugw", "ucg"}
+
 STATE_LABELS = {
     0: "Disconnected",
     1: "Connected",
@@ -91,6 +95,14 @@ def load_port_profiles() -> dict:
     except Exception:   # noqa: BLE001 - missing/invalid file → empty set
         return {}
     return data.get("port_profiles", {}) or {}
+
+
+def load_setup_defaults() -> dict:
+    """Return first-boot setup defaults from config/setup_config.yaml (best effort)."""
+    try:
+        return config_io.load(config_io.CONFIG_DIR / "setup_config.yaml") or {}
+    except Exception:   # noqa: BLE001
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -119,24 +131,20 @@ class ConnectWorker(QThread):
 
     done = Signal(bool, str, object)   # success, message, client | None
 
-    def __init__(self, host: str, username: str, password: str, configured: bool) -> None:
+    def __init__(self, host: str, username: str, password: str, configured: bool,
+                 setup_params: dict | None = None) -> None:
         super().__init__()
         self.host = host
         self.username = username
         self.password = password
         self.configured = configured
+        self.setup_params = setup_params
 
     def run(self) -> None:
         client = UniFiClient(self.host, verify_ssl=False)
         try:
-            if not self.configured:
-                client.check_setup_status()   # reachability; raises if unreachable
-                self.done.emit(
-                    True,
-                    "Device reachable — factory-default state. First-boot setup "
-                    "will create the admin account during deployment.",
-                    None,
-                )
+            if self.setup_params:
+                self._run_setup(client)
                 return
 
             if self.username and self.password:
@@ -154,6 +162,61 @@ class ConnectWorker(QThread):
             self.done.emit(False, f"Cannot reach {self.host}: {exc}", None)
         except Exception as exc:   # noqa: BLE001 - surface anything unexpected to the user
             self.done.emit(False, str(exc), None)
+
+    def _run_setup(self, client: UniFiClient) -> None:
+        """Create the admin account, then log in — retrying for the post-setup window."""
+        user = self.setup_params["username"]
+        pwd = self.setup_params["password"]
+        already = False
+        try:
+            client.initial_setup(**self.setup_params)
+        except UniFiAPIError as exc:
+            # The device may already be configured (e.g. a prior partial attempt).
+            # Fall through to logging in with the supplied admin credentials.
+            if exc.status_code == 500 or "already configured" in str(exc).lower():
+                already = True
+            else:
+                self.done.emit(False, f"First-boot setup failed: {exc}", None)
+                return
+        except UniFiConnectionError as exc:
+            self.done.emit(False, f"First-boot setup failed: {exc}", None)
+            return
+
+        # After /api/setup the device needs a few seconds before login works.
+        err = self._login_with_retries(client, user, pwd, attempts=6, delay=5)
+        if err is None:
+            verb = "Already configured" if already else "Device set up"
+            self.done.emit(True, f"{verb} — logged in as '{user}'.", client)
+        elif already:
+            self.done.emit(
+                False,
+                f"Device is already configured and the supplied admin credentials "
+                f"were rejected ({err}). Switch off 'First-boot setup' and log in "
+                f"with the correct credentials.",
+                None,
+            )
+        else:
+            self.done.emit(
+                False,
+                f"Setup succeeded but login did not within the retry window ({err}). "
+                f"Wait a moment, then switch off 'First-boot setup' and log in.",
+                None,
+            )
+
+    @staticmethod
+    def _login_with_retries(client: UniFiClient, user: str, pwd: str,
+                            attempts: int, delay: int) -> str | None:
+        """Try to log in up to ``attempts`` times. Returns None on success, else the last error."""
+        last = "unknown error"
+        for i in range(attempts):
+            try:
+                client.login(user, pwd)
+                return None
+            except UniFiConnectionError as exc:
+                last = str(exc)
+                if i < attempts - 1:
+                    time.sleep(delay)
+        return last
 
 
 class DeviceLoadWorker(QThread):
@@ -178,44 +241,67 @@ class DeviceLoadWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class LoginDialog(QDialog):
-    """Collects credentials and verifies the connection before accepting.
+    """Connects to the device, running first-boot setup when needed.
 
-    Blank username/password fall back to the device defaults. The dialog only
-    accepts (allowing navigation) once the connection has been confirmed; on
-    failure it stays open and shows the error. On success the authenticated
-    client (or None for a reachable factory device) is exposed as ``.client``.
+    For a factory-default device the dialog defaults to "First-boot setup" mode:
+    it creates the admin account (from config/setup_config.yaml, editable here)
+    and logs in with it. For a configured device it logs in with the entered
+    credentials (blank → factory defaults). The dialog only accepts once the
+    connection is confirmed; the authenticated client is exposed as ``.client``.
     """
 
     def __init__(self, device_label: str, host: str, configured: bool, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Device login")
+        self.setWindowTitle("Connect to device")
         self.setModal(True)
-        self._configured = configured
         self._worker: ConnectWorker | None = None
         self.client: UniFiClient | None = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(f"<b>{device_label}</b>"))
 
-        form = QFormLayout()
         self.host_edit = QLineEdit(host)
+        host_form = QFormLayout()
+        host_form.addRow("Host", self.host_edit)
+        layout.addLayout(host_form)
+
+        self.setup_check = QCheckBox("First-boot setup (create the admin account on a factory device)")
+        self.setup_check.setChecked(not configured)
+        self.setup_check.toggled.connect(self._update_mode)
+        layout.addWidget(self.setup_check)
+
+        # --- Login group (configured device) ---
+        self.login_group = QGroupBox("Log in")
+        login_form = QFormLayout(self.login_group)
         self.user_edit = QLineEdit()
         self.user_edit.setPlaceholderText("blank → try device defaults")
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.Password)
         self.pass_edit.setPlaceholderText("blank → try device defaults")
-        form.addRow("Host", self.host_edit)
-        form.addRow("Username", self.user_edit)
-        form.addRow("Password", self.pass_edit)
-        layout.addLayout(form)
+        login_form.addRow("Username", self.user_edit)
+        login_form.addRow("Password", self.pass_edit)
+        layout.addWidget(self.login_group)
 
-        hint = QLabel(
-            "Leave username and password blank to try the factory/default "
-            "credentials. The connection is verified before continuing."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray;")
-        layout.addWidget(hint)
+        # --- Setup group (factory device) ---
+        d = load_setup_defaults()
+        self.setup_group = QGroupBox("First-boot setup")
+        setup_form = QFormLayout(self.setup_group)
+        self.dev_name_edit = QLineEdit(str(d.get("device_name", "My-Gateway")))
+        self.admin_user_edit = QLineEdit(str(d.get("admin_username", "admin")))
+        self.admin_pass_edit = QLineEdit(str(d.get("admin_password", "")))
+        self.country_spin = QSpinBox()
+        self.country_spin.setRange(0, 999)
+        self.country_spin.setValue(int(d.get("country", 840) or 840))
+        self.tz_edit = QLineEdit(str(d.get("timezone", "")))
+        setup_form.addRow("Device name", self.dev_name_edit)
+        setup_form.addRow("Admin username", self.admin_user_edit)
+        setup_form.addRow("Admin password", self.admin_pass_edit)
+        setup_form.addRow("Country code", self.country_spin)
+        setup_form.addRow("Timezone", self.tz_edit)
+        warn_lbl = QLabel("⚠ This creates a real admin account on the device.")
+        warn_lbl.setStyleSheet("color: #b06000;")
+        setup_form.addRow("", warn_lbl)
+        layout.addWidget(self.setup_group)
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -227,32 +313,55 @@ class LoginDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        self.user_edit.setFocus()
+        self._update_mode()
 
-    def values(self) -> tuple[str, str, str]:
-        """Return (host, username, password) with surrounding whitespace stripped."""
-        return (
-            self.host_edit.text().strip(),
-            self.user_edit.text().strip(),
-            self.pass_edit.text(),
-        )
+    # -- mode toggle -----------------------------------------------------
+
+    def _is_setup(self) -> bool:
+        return self.setup_check.isChecked()
+
+    def _update_mode(self) -> None:
+        setup = self._is_setup()
+        self.setup_group.setVisible(setup)
+        self.login_group.setVisible(not setup)
+        self.adjustSize()
+
+    def _setup_params(self) -> dict:
+        return {
+            "device_name": self.dev_name_edit.text().strip() or "My-Gateway",
+            "username": self.admin_user_edit.text().strip() or "admin",
+            "password": self.admin_pass_edit.text(),
+            "country": self.country_spin.value(),
+            "timezone": self.tz_edit.text().strip() or None,
+        }
 
     # -- connection verification ----------------------------------------
 
     def _set_busy(self, busy: bool) -> None:
-        for w in (self.host_edit, self.user_edit, self.pass_edit, self.buttons):
+        for w in (self.host_edit, self.setup_check, self.login_group,
+                  self.setup_group, self.buttons):
             w.setEnabled(not busy)
 
     def _verify_and_accept(self) -> None:
-        host, username, password = self.values()
+        host = self.host_edit.text().strip()
         if not host:
             self.status.setText("<span style='color:#b00;'>Enter a host.</span>")
             return
 
-        self._set_busy(True)
-        self.status.setText("Connecting…")
+        setup_params = None
+        if self._is_setup():
+            setup_params = self._setup_params()
+            if not setup_params["password"]:
+                self.status.setText("<span style='color:#b00;'>Enter an admin password.</span>")
+                return
 
-        self._worker = ConnectWorker(host, username, password, self._configured)
+        self._set_busy(True)
+        self.status.setText("Setting up device…" if setup_params else "Connecting…")
+
+        self._worker = ConnectWorker(
+            host, self.user_edit.text().strip(), self.pass_edit.text(),
+            configured=not self._is_setup(), setup_params=setup_params,
+        )
         self._worker.done.connect(self._on_verified)
         self._worker.start()
 
@@ -648,6 +757,7 @@ class ConfigPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._client: UniFiClient | None = None
+        self._host: str = ""
         self._loader: DeviceLoadWorker | None = None
         self._profiles = load_port_profiles()          # {key: definition}
         self._rows: list[tuple[dict, QComboBox]] = []   # applicable (device, combo)
@@ -706,8 +816,9 @@ class ConfigPage(QWidget):
 
     # -- session handoff -------------------------------------------------
 
-    def set_client(self, client: UniFiClient | None, label: str) -> None:
+    def set_client(self, client: UniFiClient | None, label: str, host: str = "") -> None:
         self._client = client
+        self._host = host
         self.title.setText(f"<h2>Configure Devices</h2><span>{label}</span>")
         self.output.clear()
         self._load_devices()
@@ -748,9 +859,12 @@ class ConfigPage(QWidget):
             name = dev.get("name") or dev.get("mac", "?")
             state = STATE_LABELS.get(dev.get("state"), str(dev.get("state", "?")))
 
+            ip = dev.get("ip") or ""
+            if not ip and dtype in GATEWAY_TYPES and self._host:
+                ip = self._host   # the gateway's own record often has no ip; use the host we reached
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem(DEVICE_TYPE_LABELS.get(dtype, dtype or "?")))
-            self.table.setItem(row, 2, QTableWidgetItem(dev.get("ip", "—")))
+            self.table.setItem(row, 2, QTableWidgetItem(ip or "—"))
             self.table.setItem(row, 3, QTableWidgetItem(state))
 
             combo = QComboBox()
@@ -858,8 +972,9 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
 
+        host = dialog.host_edit.text().strip() or host
         self._set_client(dialog.client)
-        self.config_page.set_client(self._client, label)
+        self.config_page.set_client(self._client, label, host)
         self.stack.setCurrentWidget(self.config_page)
 
     def _set_client(self, client: UniFiClient | None) -> None:
